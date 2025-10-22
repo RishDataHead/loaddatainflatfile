@@ -1,0 +1,740 @@
+Let me provide the complete enterprise-grade manual cursor code directly for you to copy:
+
+## **FILE 1: `oracle_exporter.py` (Main Module)**
+
+```python
+#!/usr/bin/env python3
+"""
+Enterprise Oracle Data Exporter - Manual Cursor Approach
+========================================================
+
+Production-ready Oracle data exporter optimized for large-scale data extraction.
+Uses manual cursor approach for optimal performance and memory efficiency.
+
+Author: Data Engineering Team
+Version: 2.0.0
+"""
+
+import os
+import sys
+import csv
+import gzip
+import time
+import logging
+import hashlib
+from datetime import datetime
+from typing import Optional, Dict, Any, List, Tuple
+from pathlib import Path
+from contextlib import contextmanager
+
+import oracledb
+import psutil
+
+
+class ExportError(Exception):
+    """Base exception for export operations"""
+    pass
+
+
+class ConnectionError(ExportError):
+    """Connection related errors"""
+    pass
+
+
+class ValidationError(ExportError):
+    """Data validation errors"""
+    pass
+
+
+class OracleExporter:
+    """
+    Enterprise-grade Oracle data exporter using manual cursor approach.
+    
+    Features:
+    - Optimized cursor with configurable array sizes
+    - Memory-efficient streaming writes
+    - Comprehensive error handling
+    - Progress tracking and metrics
+    - Data validation
+    - File compression support
+    """
+    
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        service_name: str,
+        username: str,
+        password: str,
+        query: str,
+        output_file: str,
+        chunk_size: int = 50000,
+        array_size: int = 50000,
+        compression: bool = False,
+        validate: bool = True,
+        delimiter: str = ',',
+        encoding: str = 'utf-8',
+        max_retries: int = 3,
+        retry_delay: int = 5,
+        log_level: str = 'INFO'
+    ):
+        """
+        Initialize Oracle Exporter.
+        
+        Args:
+            host: Oracle database host
+            port: Oracle database port
+            service_name: Oracle service name
+            username: Database username
+            password: Database password
+            query: SQL query to execute
+            output_file: Output file path
+            chunk_size: Number of rows to fetch per iteration (default: 50000)
+            array_size: Oracle cursor array size (default: 50000)
+            compression: Enable gzip compression (default: False)
+            validate: Validate export after completion (default: True)
+            delimiter: CSV delimiter (default: ',')
+            encoding: File encoding (default: 'utf-8')
+            max_retries: Maximum retry attempts (default: 3)
+            retry_delay: Delay between retries in seconds (default: 5)
+            log_level: Logging level (default: 'INFO')
+        """
+        # Database configuration
+        self.host = host
+        self.port = port
+        self.service_name = service_name
+        self.username = username
+        self.password = password
+        
+        # Export configuration
+        self.query = query
+        self.output_file = output_file
+        self.chunk_size = chunk_size
+        self.array_size = array_size
+        self.compression = compression
+        self.validate = validate
+        self.delimiter = delimiter
+        self.encoding = encoding
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        
+        # Runtime state
+        self.connection = None
+        self.cursor = None
+        self.start_time = None
+        self.rows_exported = 0
+        self.file_handle = None
+        
+        # Setup logging
+        self._setup_logging(log_level)
+        
+        # Performance metrics
+        self.metrics = {
+            'rows_exported': 0,
+            'duration_seconds': 0,
+            'throughput_rows_per_second': 0,
+            'file_size_bytes': 0,
+            'memory_peak_mb': 0,
+            'checksum': None
+        }
+    
+    def _setup_logging(self, log_level: str):
+        """Setup logging configuration"""
+        log_format = '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+        
+        # Create logs directory if it doesn't exist
+        log_dir = Path('logs')
+        log_dir.mkdir(exist_ok=True)
+        
+        log_file = log_dir / f'oracle_export_{datetime.now().strftime("%Y%m%d")}.log'
+        
+        logging.basicConfig(
+            level=getattr(logging, log_level.upper()),
+            format=log_format,
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        
+        self.logger = logging.getLogger(self.__class__.__name__)
+    
+    def _get_dsn(self) -> str:
+        """Generate Oracle DSN string"""
+        return f"{self.host}:{self.port}/{self.service_name}"
+    
+    @contextmanager
+    def _get_connection(self):
+        """
+        Get database connection with automatic cleanup.
+        Implements retry logic for transient failures.
+        """
+        connection = None
+        last_exception = None
+        
+        for attempt in range(self.max_retries):
+            try:
+                self.logger.info(f"Attempting database connection (attempt {attempt + 1}/{self.max_retries})")
+                
+                connection = oracledb.connect(
+                    user=self.username,
+                    password=self.password,
+                    dsn=self._get_dsn()
+                )
+                
+                self.logger.info(f"Connected to Oracle Database version: {connection.version}")
+                yield connection
+                return
+                
+            except oracledb.Error as e:
+                last_exception = e
+                error_obj, = e.args
+                self.logger.error(f"Connection attempt {attempt + 1} failed: {error_obj.message}")
+                
+                if attempt < self.max_retries - 1:
+                    delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
+                    self.logger.info(f"Retrying in {delay} seconds...")
+                    time.sleep(delay)
+                else:
+                    raise ConnectionError(f"Failed to connect after {self.max_retries} attempts: {error_obj.message}")
+            
+            finally:
+                if connection:
+                    try:
+                        connection.close()
+                        self.logger.info("Database connection closed")
+                    except:
+                        pass
+    
+    def _optimize_query(self, query: str) -> str:
+        """
+        Add Oracle performance hints to the query.
+        
+        Args:
+            query: Original SQL query
+            
+        Returns:
+            Optimized query with hints
+        """
+        if query.strip().upper().startswith('SELECT'):
+            # Add performance hints
+            hints = f"/*+ FIRST_ROWS({self.chunk_size}) PARALLEL(4) */"
+            optimized = query.replace('SELECT', f'SELECT {hints}', 1)
+            self.logger.debug(f"Applied performance hints to query")
+            return optimized
+        
+        return query
+    
+    def _get_file_handle(self):
+        """
+        Get file handle for writing (compressed or uncompressed).
+        
+        Returns:
+            File handle object
+        """
+        # Create output directory if it doesn't exist
+        output_dir = Path(self.output_file).parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        if self.compression:
+            file_path = f"{self.output_file}.gz"
+            self.logger.info(f"Opening compressed output file: {file_path}")
+            return gzip.open(file_path, 'wt', encoding=self.encoding, newline='')
+        else:
+            self.logger.info(f"Opening output file: {self.output_file}")
+            return open(self.output_file, 'w', encoding=self.encoding, newline='')
+    
+    def _monitor_memory(self) -> float:
+        """
+        Monitor current memory usage.
+        
+        Returns:
+            Memory usage in MB
+        """
+        process = psutil.Process()
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        
+        if memory_mb > self.metrics['memory_peak_mb']:
+            self.metrics['memory_peak_mb'] = memory_mb
+        
+        return memory_mb
+    
+    def _log_progress(self, rows_processed: int, elapsed_time: float):
+        """
+        Log export progress with performance metrics.
+        
+        Args:
+            rows_processed: Number of rows processed so far
+            elapsed_time: Time elapsed since export start
+        """
+        throughput = rows_processed / elapsed_time if elapsed_time > 0 else 0
+        memory_mb = self._monitor_memory()
+        
+        self.logger.info(
+            f"Progress: {rows_processed:,} rows | "
+            f"{throughput:,.0f} rows/s | "
+            f"Memory: {memory_mb:.1f} MB | "
+            f"Time: {elapsed_time:.1f}s"
+        )
+    
+    def _calculate_checksum(self, file_path: str) -> str:
+        """
+        Calculate MD5 checksum of the exported file.
+        
+        Args:
+            file_path: Path to the file
+            
+        Returns:
+            MD5 checksum string
+        """
+        self.logger.info("Calculating file checksum...")
+        hash_md5 = hashlib.md5()
+        
+        # Handle both compressed and uncompressed files
+        if file_path.endswith('.gz'):
+            with gzip.open(file_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_md5.update(chunk)
+        else:
+            with open(file_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_md5.update(chunk)
+        
+        checksum = hash_md5.hexdigest()
+        self.logger.info(f"File checksum: {checksum}")
+        return checksum
+    
+    def _validate_export(self, expected_columns: int) -> bool:
+        """
+        Validate the exported file structure and integrity.
+        
+        Args:
+            expected_columns: Number of expected columns
+            
+        Returns:
+            True if validation passes, False otherwise
+        """
+        self.logger.info("Validating export file...")
+        
+        try:
+            file_path = f"{self.output_file}.gz" if self.compression else self.output_file
+            
+            # Check file exists
+            if not os.path.exists(file_path):
+                self.logger.error(f"Export file not found: {file_path}")
+                return False
+            
+            # Check file size
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                self.logger.error("Export file is empty")
+                return False
+            
+            self.logger.info(f"File size: {file_size:,} bytes ({file_size / 1024 / 1024:.2f} MB)")
+            
+            # Validate CSV structure
+            open_func = gzip.open if self.compression else open
+            mode = 'rt' if self.compression else 'r'
+            
+            with open_func(file_path, mode, encoding=self.encoding) as f:
+                reader = csv.reader(f, delimiter=self.delimiter)
+                
+                # Check header
+                header = next(reader)
+                if len(header) != expected_columns:
+                    self.logger.error(
+                        f"Header column count mismatch: expected {expected_columns}, got {len(header)}"
+                    )
+                    return False
+                
+                # Sample first few data rows
+                sample_size = 0
+                for i, row in enumerate(reader):
+                    if i >= 10:  # Check first 10 rows
+                        break
+                    sample_size += 1
+                    if len(row) != expected_columns:
+                        self.logger.error(
+                            f"Data row {i+1} column count mismatch: expected {expected_columns}, got {len(row)}"
+                        )
+                        return False
+                
+                self.logger.info(f"Validated {sample_size} sample rows successfully")
+            
+            self.logger.info("Export validation passed ✓")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Validation failed: {e}")
+            return False
+    
+    def export(self) -> Dict[str, Any]:
+        """
+        Execute the data export operation.
+        
+        Returns:
+            Dictionary containing export results and metrics
+            
+        Raises:
+            ExportError: If export fails
+        """
+        self.start_time = time.time()
+        self.rows_exported = 0
+        
+        self.logger.info("=" * 70)
+        self.logger.info("Starting Oracle Data Export")
+        self.logger.info("=" * 70)
+        self.logger.info(f"Host: {self.host}:{self.port}/{self.service_name}")
+        self.logger.info(f"Output file: {self.output_file}")
+        self.logger.info(f"Chunk size: {self.chunk_size:,}")
+        self.logger.info(f"Array size: {self.array_size:,}")
+        self.logger.info(f"Compression: {self.compression}")
+        self.logger.info(f"Validation: {self.validate}")
+        
+        try:
+            with self._get_connection() as connection:
+                cursor = connection.cursor()
+                
+                # Optimize cursor settings for performance
+                cursor.arraysize = self.array_size
+                cursor.prefetchrows = self.array_size + 1
+                
+                self.logger.info(f"Cursor configured: arraysize={cursor.arraysize}, prefetchrows={cursor.prefetchrows}")
+                
+                # Execute optimized query
+                optimized_query = self._optimize_query(self.query)
+                self.logger.info("Executing query...")
+                self.logger.debug(f"Query: {optimized_query}")
+                
+                cursor.execute(optimized_query)
+                
+                # Get column metadata
+                columns = [desc[0] for desc in cursor.description]
+                column_count = len(columns)
+                
+                self.logger.info(f"Query executed successfully. Columns: {column_count}")
+                self.logger.debug(f"Column names: {', '.join(columns)}")
+                
+                # Open output file
+                with self._get_file_handle() as file_handle:
+                    writer = csv.writer(file_handle, delimiter=self.delimiter)
+                    
+                    # Write header
+                    writer.writerow(columns)
+                    self.logger.info("Header written")
+                    
+                    # Process data in chunks using manual cursor
+                    progress_interval = self.chunk_size * 10  # Log progress every 10 chunks
+                    last_progress_log = 0
+                    
+                    while True:
+                        # Fetch chunk of rows
+                        rows = cursor.fetchmany(self.chunk_size)
+                        
+                        if not rows:
+                            break
+                        
+                        # Write rows to file
+                        writer.writerows(rows)
+                        self.rows_exported += len(rows)
+                        
+                        # Log progress periodically
+                        if self.rows_exported - last_progress_log >= progress_interval:
+                            elapsed = time.time() - self.start_time
+                            self._log_progress(self.rows_exported, elapsed)
+                            last_progress_log = self.rows_exported
+                    
+                    self.logger.info(f"Data export completed: {self.rows_exported:,} total rows")
+                
+                cursor.close()
+            
+            # Calculate final metrics
+            end_time = time.time()
+            duration = end_time - self.start_time
+            throughput = self.rows_exported / duration if duration > 0 else 0
+            
+            file_path = f"{self.output_file}.gz" if self.compression else self.output_file
+            file_size = os.path.getsize(file_path)
+            checksum = self._calculate_checksum(file_path)
+            
+            # Store metrics
+            self.metrics.update({
+                'rows_exported': self.rows_exported,
+                'duration_seconds': round(duration, 2),
+                'throughput_rows_per_second': round(throughput, 2),
+                'file_size_bytes': file_size,
+                'file_size_mb': round(file_size / 1024 / 1024, 2),
+                'memory_peak_mb': round(self.metrics['memory_peak_mb'], 2),
+                'checksum': checksum,
+                'status': 'success'
+            })
+            
+            # Validate export if enabled
+            if self.validate:
+                validation_passed = self._validate_export(column_count)
+                self.metrics['validation_passed'] = validation_passed
+                
+                if not validation_passed:
+                    raise ValidationError("Export validation failed")
+            
+            # Log final summary
+            self.logger.info("=" * 70)
+            self.logger.info("Export Summary")
+            self.logger.info("=" * 70)
+            self.logger.info(f"Status: SUCCESS ✓")
+            self.logger.info(f"Rows exported: {self.metrics['rows_exported']:,}")
+            self.logger.info(f"Duration: {self.metrics['duration_seconds']}s")
+            self.logger.info(f"Throughput: {self.metrics['throughput_rows_per_second']:,.0f} rows/s")
+            self.logger.info(f"File size: {self.metrics['file_size_mb']} MB")
+            self.logger.info(f"Peak memory: {self.metrics['memory_peak_mb']} MB")
+            self.logger.info(f"Checksum: {self.metrics['checksum']}")
+            self.logger.info("=" * 70)
+            
+            return self.metrics
+            
+        except Exception as e:
+            self.logger.error(f"Export failed: {e}", exc_info=True)
+            
+            self.metrics.update({
+                'status': 'failed',
+                'error': str(e),
+                'rows_exported': self.rows_exported,
+                'duration_seconds': round(time.time() - self.start_time, 2) if self.start_time else 0
+            })
+            
+            raise ExportError(f"Export operation failed: {e}")
+
+
+def main():
+    """Main entry point for command-line usage"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Enterprise Oracle Data Exporter - Manual Cursor Approach',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic export
+  python oracle_exporter.py --host db.company.com --service ORCL \\
+    --username user --password pass \\
+    --query "SELECT * FROM employees" \\
+    --output employees.csv
+
+  # Large table with compression
+  python oracle_exporter.py --host db.company.com --service ORCL \\
+    --username user --password pass \\
+    --query "SELECT * FROM large_table" \\
+    --output large_export.csv \\
+    --chunk-size 100000 --array-size 100000 --compress
+
+  # Custom delimiter with validation
+  python oracle_exporter.py --host db.company.com --service ORCL \\
+    --username user --password pass \\
+    --query "SELECT * FROM data" \\
+    --output data.txt --delimiter "|" --validate
+        """
+    )
+    
+    # Database connection arguments
+    parser.add_argument('--host', required=True, help='Oracle database host')
+    parser.add_argument('--port', type=int, default=1521, help='Oracle database port (default: 1521)')
+    parser.add_argument('--service', '--service-name', dest='service_name', required=True, 
+                       help='Oracle service name')
+    parser.add_argument('--username', '-u', required=True, help='Database username')
+    parser.add_argument('--password', '-p', required=True, help='Database password')
+    
+    # Export configuration
+    parser.add_argument('--query', '-q', required=True, help='SQL query to execute')
+    parser.add_argument('--output', '-o', required=True, help='Output file path')
+    
+    # Performance tuning
+    parser.add_argument('--chunk-size', type=int, default=50000, 
+                       help='Rows per chunk (default: 50000)')
+    parser.add_argument('--array-size', type=int, default=50000, 
+                       help='Oracle array size (default: 50000)')
+    
+    # Features
+    parser.add_argument('--compress', action='store_true', help='Enable gzip compression')
+    parser.add_argument('--no-validate', action='store_true', help='Skip validation')
+    parser.add_argument('--delimiter', default=',', help='CSV delimiter (default: ,)')
+    parser.add_argument('--encoding', default='utf-8', help='File encoding (default: utf-8)')
+    
+    # Reliability
+    parser.add_argument('--max-retries', type=int, default=3, 
+                       help='Maximum retry attempts (default: 3)')
+    parser.add_argument('--retry-delay', type=int, default=5, 
+                       help='Retry delay in seconds (default: 5)')
+    
+    # Logging
+    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
+                       default='INFO', help='Logging level (default: INFO)')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output (DEBUG level)')
+    
+    args = parser.parse_args()
+    
+    # Override log level if verbose
+    if args.verbose:
+        args.log_level = 'DEBUG'
+    
+    try:
+        # Create exporter instance
+        exporter = OracleExporter(
+            host=args.host,
+            port=args.port,
+            service_name=args.service_name,
+            username=args.username,
+            password=args.password,
+            query=args.query,
+            output_file=args.output,
+            chunk_size=args.chunk_size,
+            array_size=args.array_size,
+            compression=args.compress,
+            validate=not args.no_validate,
+            delimiter=args.delimiter,
+            encoding=args.encoding,
+            max_retries=args.max_retries,
+            retry_delay=args.retry_delay,
+            log_level=args.log_level
+        )
+        
+        # Execute export
+        result = exporter.export()
+        
+        # Print summary
+        print("\n" + "=" * 70)
+        print("EXPORT COMPLETED SUCCESSFULLY ✓")
+        print("=" * 70)
+        print(f"Rows exported: {result['rows_exported']:,}")
+        print(f"Duration: {result['duration_seconds']}s")
+        print(f"Throughput: {result['throughput_rows_per_second']:,.0f} rows/second")
+        print(f"File size: {result['file_size_mb']} MB")
+        print(f"Peak memory: {result['memory_peak_mb']} MB")
+        print(f"Output file: {args.output}")
+        if args.compress:
+            print(f"Compressed file: {args.output}.gz")
+        print("=" * 70)
+        
+        sys.exit(0)
+        
+    except Exception as e:
+        print(f"\n❌ Export failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
+```
+
+## **FILE 2: `simple_usage.py` (Quick Start Example)**
+
+```python
+#!/usr/bin/env python3
+"""
+Simple Usage Example for Oracle Exporter
+========================================
+"""
+
+from oracle_exporter import OracleExporter
+
+def main():
+    """Simple usage example"""
+    
+    # Basic configuration
+    exporter = OracleExporter(
+        host='your-oracle-host.com',
+        port=1521,
+        service_name='ORCL',
+        username='your_username',
+        password='your_password',
+        query='SELECT * FROM employees WHERE hire_date >= DATE \'2020-01-01\'',
+        output_file='employees_export.csv',
+        chunk_size=50000,
+        array_size=50000,
+        compression=True,
+        validate=True
+    )
+    
+    # Execute export
+    print("Starting export...")
+    result = exporter.export()
+    
+    # Display results
+    print(f"\n✅ Export completed successfully!")
+    print(f"   Rows exported: {result['rows_exported']:,}")
+    print(f"   Duration: {result['duration_seconds']}s")
+    print(f"   Throughput: {result['throughput_rows_per_second']:,.0f} rows/s")
+    print(f"   File size: {result['file_size_mb']} MB")
+    print(f"   Memory used: {result['memory_peak_mb']} MB")
+    print(f"   Output file: employees_export.csv.gz")
+
+if __name__ == '__main__':
+    main()
+```
+
+## **FILE 3: `requirements.txt`**
+
+```txt
+oracledb>=2.5.0
+psutil>=5.9.0
+```
+
+## **How to Use**
+
+1. **Save the files**:
+   - Save the first code block as `oracle_exporter.py`
+   - Save the second as `simple_usage.py` 
+   - Save the third as `requirements.txt`
+
+2. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. **Basic usage**:
+   ```bash
+   python oracle_exporter.py \
+     --host your-db-host.com \
+     --service ORCL \
+     --username myuser \
+     --password mypass \
+     --query "SELECT * FROM employees" \
+     --output employees.csv
+   ```
+
+4. **Large table with optimization**:
+   ```bash
+   python oracle_exporter.py \
+     --host your-db-host.com \
+     --service ORCL \
+     --username myuser \
+     --password mypass \
+     --query "SELECT * FROM large_table" \
+     --output large_export.csv \
+     --chunk-size 100000 \
+     --array-size 100000 \
+     --compress \
+     --verbose
+   ```
+
+5. **Python API usage**:
+   ```python
+   from oracle_exporter import OracleExporter
+   
+   exporter = OracleExporter(
+       host='your-db-host.com',
+       port=1521,
+       service_name='ORCL',
+       username='myuser',
+       password='mypass',
+       query='SELECT * FROM large_table',
+       output_file='output.csv',
+       chunk_size=100000,
+       array_size=100000,
+       compression=True
+   )
+   
+   result = exporter.export()
+   print(f"Exported {result['rows_exported']:,} rows")
+   ```
+
+This is a complete, production-ready enterprise implementation with **620+ lines of code** that handles large Oracle table exports efficiently using the manual cursor approach!
