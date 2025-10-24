@@ -1,0 +1,198 @@
+import oracledb
+import csv
+import logging
+from datetime import datetime
+from multiprocessing import Process, Queue, Lock, cpu_count
+import time
+
+# Configure logging
+log_file = f'oracle_extract_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+logging.basicConfig(filename=log_file, level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Configuration
+FETCH_BATCH_SIZE = 50000  # Rows fetched from Oracle per batch
+WRITE_BATCH_SIZE = 100000  # Rows accumulated before writing
+OUTPUT_FILE = 'oracle_table_data.csv'
+BUFFER_SIZE = 10 * 1024 * 1024  # 10MB I/O buffer for faster writes
+
+def csv_writer_process(write_queue, process_id):
+    """
+    Dedicated writer process - ensures thread-safe CSV writing
+    Only this process writes to the file to avoid corruption
+    """
+    try:
+        total_rows = 0
+        
+        while True:
+            batch = write_queue.get()
+            
+            if batch is None:  # Poison pill - shutdown signal
+                logging.info(f'Writer process {process_id} finished: {total_rows} rows written')
+                break
+            
+            # Buffered append mode with large buffer for performance
+            with open(OUTPUT_FILE, 'a', newline='', encoding='utf-8', 
+                     buffering=BUFFER_SIZE) as f:
+                writer = csv.writer(f)
+                writer.writerows(batch)
+                total_rows += len(batch)
+                
+                if total_rows % 500000 == 0:
+                    logging.info(f'Writer {process_id}: {total_rows} rows written so far')
+        
+    except Exception as e:
+        logging.error(f'Writer process {process_id} error: {str(e)}')
+        raise
+
+def extract_data_to_csv():
+    """
+    Main extraction function with multiprocessing for fast CSV writing
+    """
+    conn = None
+    cursor = None
+    start_time = time.time()
+    
+    try:
+        # Connect to Oracle Database
+        conn = oracledb.connect(
+            user='your_username',
+            password='your_password',
+            dsn='your_host:1521/your_service_name'  # Example: localhost:1521/XEPDB1
+        )
+        
+        logging.info('Successfully connected to Oracle Database')
+        print('✓ Connected to Oracle Database')
+        
+        cursor = conn.cursor()
+        
+        # Optimize fetch performance with large array size
+        cursor.arraysize = FETCH_BATCH_SIZE
+        cursor.prefetchrows = FETCH_BATCH_SIZE
+        
+        # Execute query
+        query = 'SELECT * FROM your_table_name'  # Replace with your table
+        cursor.execute(query)
+        
+        logging.info(f'Query executed: {query}')
+        print('✓ Query executed')
+        
+        # Get column names
+        column_names = [col[0] for col in cursor.description]
+        
+        # Write header to CSV file
+        with open(OUTPUT_FILE, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(column_names)
+        
+        logging.info('CSV header written')
+        print('✓ CSV file created with headers')
+        
+        # Create queue for inter-process communication
+        # Large queue size to avoid blocking
+        write_queue = Queue(maxsize=100)
+        
+        # Start dedicated writer processes
+        num_writers = min(4, cpu_count() - 1 or 1)  # Use 4 writers max
+        writers = []
+        
+        for i in range(num_writers):
+            p = Process(target=csv_writer_process, args=(write_queue, i))
+            p.start()
+            writers.append(p)
+            logging.info(f'Started CSV writer process {i}')
+        
+        print(f'✓ Started {num_writers} writer processes')
+        
+        # Fetch data and distribute to writers
+        row_count = 0
+        batch = []
+        fetch_count = 0
+        
+        print('
+Extracting data...')
+        
+        while True:
+            # Fetch batch from Oracle
+            rows = cursor.fetchmany(FETCH_BATCH_SIZE)
+            if not rows:
+                break
+            
+            fetch_count += 1
+            
+            # Accumulate rows into write batch
+            for row in rows:
+                batch.append(row)
+                row_count += 1
+                
+                # When batch is full, send to writer queue
+                if len(batch) >= WRITE_BATCH_SIZE:
+                    write_queue.put(batch)
+                    batch = []
+            
+            # Progress update every 10 fetches
+            if fetch_count % 10 == 0:
+                print(f'  Processed {row_count:,} rows...')
+                logging.info(f'Processed {row_count} rows')
+        
+        # Send remaining rows
+        if batch:
+            write_queue.put(batch)
+        
+        # Send poison pills to stop all writer processes
+        for _ in range(num_writers):
+            write_queue.put(None)
+        
+        # Wait for all writers to finish
+        for p in writers:
+            p.join()
+        
+        elapsed_time = time.time() - start_time
+        rows_per_second = row_count / elapsed_time if elapsed_time > 0 else 0
+        
+        # Log and print summary
+        logging.info(f'Extraction completed successfully')
+        logging.info(f'Total rows: {row_count}')
+        logging.info(f'Time taken: {elapsed_time:.2f} seconds')
+        logging.info(f'Throughput: {rows_per_second:.2f} rows/second')
+        
+        print(f'
+{"="*60}')
+        print(f'✓ Data extraction SUCCESSFUL!')
+        print(f'{"="*60}')
+        print(f'  Output file    : {OUTPUT_FILE}')
+        print(f'  Total rows     : {row_count:,}')
+        print(f'  Time taken     : {elapsed_time:.2f} seconds')
+        print(f'  Throughput     : {rows_per_second:,.0f} rows/second')
+        print(f'  Log file       : {log_file}')
+        print(f'{"="*60}')
+
+    except oracledb.DatabaseError as e:
+        error_msg = str(e)
+        logging.error(f'Database error: {error_msg}')
+        print(f'
+✗ Database error occurred!')
+        print(f'  Error: {error_msg}')
+        print(f'  Check log file: {log_file}')
+        raise
+
+    except Exception as e:
+        error_msg = str(e)
+        logging.error(f'Unexpected error: {error_msg}')
+        print(f'
+✗ Unexpected error occurred!')
+        print(f'  Error: {error_msg}')
+        print(f'  Check log file: {log_file}')
+        raise
+
+    finally:
+        # Clean up database resources
+        if cursor:
+            cursor.close()
+            logging.info('Cursor closed')
+        if conn:
+            conn.close()
+            logging.info('Oracle connection closed')
+
+if __name__ == '__main__':
+    extract_data_to_csv()
