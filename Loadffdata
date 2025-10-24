@@ -1,0 +1,73 @@
+import oracledb
+import csv
+import logging
+from datetime import datetime
+
+# Configure logging
+log_file = f'oracle_extract_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+logging.basicConfig(filename=log_file, level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+def extract_data_to_file():
+    conn = None
+    cursor = None
+    output_file = 'oracle_table_data.csv'
+
+    try:
+        # Oracle connection using oracledb - replace with your details
+        conn = oracledb.connect(
+            user='your_username',
+            password='your_password',
+            dsn='your_host:1521/your_service_name'  # Example: localhost:1521/XEPDB1
+        )
+        
+        logging.info('Successfully connected to Oracle Database')
+        cursor = conn.cursor()
+
+        # Execute query
+        query = 'SELECT * FROM your_table_name'  # Replace with your table name
+        cursor.execute(query)
+        
+        logging.info(f'Query executed: {query}')
+
+        # Get column names
+        column_names = [col[0] for col in cursor.description]
+
+        # Write to CSV file
+        row_count = 0
+        with open(output_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(column_names)  # Write header
+            
+            for row in cursor:
+                writer.writerow(row)  # Write data rows
+                row_count += 1
+
+        logging.info(f'Data successfully written to {output_file}. Total rows: {row_count}')
+        print(f'✓ Data extraction successful!')
+        print(f'✓ Output saved to: {output_file}')
+        print(f'✓ Total rows extracted: {row_count}')
+
+    except oracledb.DatabaseError as e:
+        error = str(e)
+        logging.error(f'Database error: {error}')
+        print(f'✗ Database error occurred. Check log file: {log_file}')
+
+    except IOError as e:
+        logging.error(f'File I/O error: {str(e)}')
+        print(f'✗ File error occurred. Check log file: {log_file}')
+
+    except Exception as e:
+        logging.error(f'Unexpected error: {str(e)}')
+        print(f'✗ Unexpected error occurred. Check log file: {log_file}')
+
+    finally:
+        if cursor:
+            cursor.close()
+            logging.info('Cursor closed')
+        if conn:
+            conn.close()
+            logging.info('Oracle connection closed')
+
+if __name__ == '__main__':
+    extract_data_to_file()
